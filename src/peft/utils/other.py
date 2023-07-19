@@ -14,8 +14,35 @@
 # limitations under the License.
 
 import copy
+import os
+import warnings
 
 import torch
+
+
+# Add or edit model card to have `library_name: peft`
+def add_library_to_model_card(output_dir):
+    if os.path.exists(os.path.join(output_dir, "README.md")):
+        with open(os.path.join(output_dir, "README.md"), "r") as f:
+            lines = f.readlines()
+        # check if the first line is `---`
+        if len(lines) > 0 and lines[0].startswith("---"):
+            for i, line in enumerate(lines[1:]):
+                # check if line starts with `library_name`, if yes, update it
+                if line.startswith("library_name"):
+                    lines[i + 1] = "library_name: peft\n"
+                    break
+                elif line.startswith("---"):
+                    # insert `library_name: peft` before the last `---`
+                    lines.insert(i + 1, "library_name: peft\n")
+                    break
+        else:
+            lines = ["---\n", "library_name: peft\n", "---\n"] + lines
+    else:
+        lines = ["---\n", "library_name: peft\n", "---\n"]
+    # write the lines back to README.md
+    with open(os.path.join(output_dir, "README.md"), "w") as f:
+        f.writelines(lines)
 
 
 # needed for prefix-tuning of bloom model
@@ -32,9 +59,7 @@ def bloom_model_postprocess_past_key_value(past_key_values):
     return tuple(zip(keys, values))
 
 
-def prepare_model_for_int8_training(
-    model, output_embedding_layer_name="lm_head", use_gradient_checkpointing=True, layer_norm_names=["layer_norm"]
-):
+def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True):
     r"""
     This method wraps the entire protocol for preparing a model before running a training. This includes:
         1- Cast the layernorm in fp32 2- making output embedding layer require grads 3- Add the upcasting of the lm
@@ -44,18 +69,18 @@ def prepare_model_for_int8_training(
         model, (`transformers.PreTrainedModel`):
             The loaded model from `transformers`
     """
-    loaded_in_8bit = getattr(model, "is_loaded_in_8bit", False)
+    loaded_in_kbit = getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False)
 
     for name, param in model.named_parameters():
         # freeze base model's layers
         param.requires_grad = False
 
-        if loaded_in_8bit:
-            # cast layer norm in fp32 for stability for 8bit models
-            if param.ndim == 1 and any(layer_norm_name in name for layer_norm_name in layer_norm_names):
-                param.data = param.data.to(torch.float32)
+    # cast all non INT8 parameters to fp32
+    for param in model.parameters():
+        if (param.dtype == torch.float16) or (param.dtype == torch.bfloat16):
+            param.data = param.data.to(torch.float32)
 
-    if loaded_in_8bit and use_gradient_checkpointing:
+    if loaded_in_kbit and use_gradient_checkpointing:
         # For backward compatibility
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
@@ -69,23 +94,16 @@ def prepare_model_for_int8_training(
         # enable gradient checkpointing for memory efficiency
         model.gradient_checkpointing_enable()
 
-    if hasattr(model, output_embedding_layer_name):
-        output_embedding_layer = getattr(model, output_embedding_layer_name)
-        input_dtype = output_embedding_layer.weight.dtype
-
-        class CastOutputToFloat(torch.nn.Sequential):
-            r"""
-            Manually cast to the expected dtype of the lm_head as sometimes there is a final layer norm that is casted
-            in fp32
-
-            """
-
-            def forward(self, x):
-                return super().forward(x.to(input_dtype)).to(torch.float32)
-
-        setattr(model, output_embedding_layer_name, CastOutputToFloat(output_embedding_layer))
-
     return model
+
+
+# For backward compatibility
+def prepare_model_for_int8_training(*args, **kwargs):
+    warnings.warn(
+        "prepare_model_for_int8_training is deprecated and will be removed in a future version. Use prepare_model_for_kbit_training instead.",
+        FutureWarning,
+    )
+    return prepare_model_for_kbit_training(*args, **kwargs)
 
 
 # copied from transformers.models.bart.modeling_bart
@@ -160,6 +178,48 @@ def _set_adapter(model, adapter_name):
             module.active_adapter = adapter_name
 
 
+def _prepare_prompt_learning_config(peft_config, model_config):
+    if peft_config.num_layers is None:
+        if "num_hidden_layers" in model_config:
+            num_layers = model_config["num_hidden_layers"]
+        elif "num_layers" in model_config:
+            num_layers = model_config["num_layers"]
+        elif "n_layer" in model_config:
+            num_layers = model_config["n_layer"]
+        else:
+            raise ValueError("Please specify `num_layers` in `peft_config`")
+        peft_config.num_layers = num_layers
+
+    if peft_config.token_dim is None:
+        if "hidden_size" in model_config:
+            token_dim = model_config["hidden_size"]
+        elif "n_embd" in model_config:
+            token_dim = model_config["n_embd"]
+        elif "d_model" in model_config:
+            token_dim = model_config["d_model"]
+        else:
+            raise ValueError("Please specify `token_dim` in `peft_config`")
+        peft_config.token_dim = token_dim
+
+    if peft_config.num_attention_heads is None:
+        if "num_attention_heads" in model_config:
+            num_attention_heads = model_config["num_attention_heads"]
+        elif "n_head" in model_config:
+            num_attention_heads = model_config["n_head"]
+        elif "num_heads" in model_config:
+            num_attention_heads = model_config["num_heads"]
+        elif "encoder_attention_heads" in model_config:
+            num_attention_heads = model_config["encoder_attention_heads"]
+        else:
+            raise ValueError("Please specify `num_attention_heads` in `peft_config`")
+        peft_config.num_attention_heads = num_attention_heads
+
+    if getattr(peft_config, "encoder_hidden_size", None) is None:
+        setattr(peft_config, "encoder_hidden_size", peft_config.token_dim)
+
+    return peft_config
+
+
 def fsdp_auto_wrap_policy(model):
     import functools
     import os
@@ -219,7 +279,56 @@ TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING = {
     "layoutlm": ["query", "value"],
     "llama": ["q_proj", "v_proj"],
     "chatglm": ["query_key_value"],
+    "gpt_bigcode": ["c_attn"],
+    "mpt": ["Wqkv"],
+    "RefinedWebModel": ["query_key_value"],
+    "RefinedWeb": ["query_key_value"],
+    "falcon": ["query_key_value"],
 }
+
+TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING = {
+    "t5": ["k", "v", "wo"],
+    "mt5": ["k", "v", "wi_1"],
+    "gpt2": ["c_attn", "mlp.c_proj"],
+    "bloom": ["query_key_value", "mlp.dense_4h_to_h"],
+    "roberta": ["key", "value", "output.dense"],
+    "opt": ["q_proj", "k_proj", "fc2"],
+    "gptj": ["q_proj", "v_proj", "fc_out"],
+    "gpt_neox": ["query_key_value", "dense_4h_to_h"],
+    "gpt_neo": ["q_proj", "v_proj", "c_proj"],
+    "bart": ["q_proj", "v_proj", "fc2"],
+    "gpt_bigcode": ["c_attn", "mlp.c_proj"],
+    "llama": ["k_proj", "v_proj", "down_proj"],
+    "bert": ["key", "value", "output.dense"],
+    "deberta-v2": ["key_proj", "value_proj", "output.dense"],
+    "deberta": ["in_proj", "output.dense"],
+    "RefinedWebModel": ["query_key_value"],
+    "RefinedWeb": ["query_key_value"],
+    "falcon": ["query_key_value"],
+}
+
+TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING = {
+    "t5": ["wo"],
+    "mt5": [],
+    "gpt2": ["mlp.c_proj"],
+    "bloom": ["mlp.dense_4h_to_h"],
+    "roberta": ["output.dense"],
+    "opt": ["fc2"],
+    "gptj": ["fc_out"],
+    "gpt_neox": ["dense_4h_to_h"],
+    "gpt_neo": ["c_proj"],
+    "bart": ["fc2"],
+    "gpt_bigcode": ["mlp.c_proj"],
+    "llama": ["down_proj"],
+    "bert": ["output.dense"],
+    "deberta-v2": ["output.dense"],
+    "deberta": ["output.dense"],
+    "RefinedWeb": ["query_key_value"],
+    "RefinedWebModel": ["query_key_value"],
+    "falcon": ["query_key_value"],
+}
+
+COMMON_LAYERS_PATTERN = ["layers", "h", "block", "blocks", "layer"]
 
 TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING = {
     "t5": ["q", "k", "v", "o", "wi", "wo"],
@@ -245,4 +354,6 @@ TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING = {
 }
 
 WEIGHTS_NAME = "adapter_model.bin"
+SAFETENSORS_WEIGHTS_NAME = "adapter_model.safetensors"
 CONFIG_NAME = "adapter_config.json"
+CLAMP_QUANTILE = 0.99
